@@ -1,4 +1,11 @@
-streamlit
-requests
+streamlit==1.32.2
+
+transformers==4.36.2
+sentencepiece
+torch==2.1.2+cpu
+torchvision==0.16.2+cpu
+torchaudio==2.1.2+cpu
+
 scikit-learn
-serpapi
+google-search-results
+protobuf<4
