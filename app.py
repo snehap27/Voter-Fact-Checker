@@ -1,5 +1,5 @@
 import streamlit as st
-from transformers import pipeline
+import requests
 from serpapi import GoogleSearch
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -19,25 +19,30 @@ st.write(
     "It does not support or oppose any political ideology."
 )
 
-# -------------------------
-# Load models
-# -------------------------
-@st.cache_resource
-def load_classifier():
-    return pipeline(
-        "zero-shot-classification",
-        model="typeform/distilbert-base-uncased-mnli"
-    )
+HF_API_KEY = st.secrets["HF_API_KEY"]
+HF_HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"}
 
-@st.cache_resource
-def load_reasoner():
-    return pipeline(
-        "text2text-generation",
-        model="google/flan-t5-base"
-    )
+# -------------------------
+# HF API helpers
+# -------------------------
+def hf_zero_shot(text, labels):
+    url = "https://api-inference.huggingface.co/models/facebook/bart-large-mnli"
+    payload = {
+        "inputs": text,
+        "parameters": {"candidate_labels": labels}
+    }
+    r = requests.post(url, headers=HF_HEADERS, json=payload, timeout=60)
+    return r.json()
 
-classifier = load_classifier()
-reasoner = load_reasoner()
+def hf_explain(prompt):
+    url = "https://api-inference.huggingface.co/models/google/flan-t5-base"
+    payload = {
+        "inputs": prompt,
+        "parameters": {"max_new_tokens": 200}
+    }
+    r = requests.post(url, headers=HF_HEADERS, json=payload, timeout=60)
+    out = r.json()
+    return out[0]["generated_text"] if isinstance(out, list) else "Explanation unavailable."
 
 # -------------------------
 # Trusted sources
@@ -51,67 +56,34 @@ TRUSTED_SITES = [
 ]
 
 # -------------------------
-# Explanation (ROBUST)
+# Explanation
 # -------------------------
 def explain_claim(claim, prediction):
-    prompt = (
-        "You are a neutral fact-checking assistant.\n\n"
-        f"Claim: {claim}\n\n"
-        f"Classification: {prediction}\n\n"
-        "Explain why this claim may be misleading.\n"
-        "Do NOT repeat the claim.\n"
-        "Mention missing context, legal or constitutional process, "
-        "and why the conclusion is oversimplified.\n"
-        "Write 4 complete sentences.\n\n"
-        "Explanation:"
-    )
+    prompt = f"""
+You are a neutral fact-checking assistant.
 
-    output = reasoner(
-        prompt,
-        max_length=220,
-        do_sample=True,
-        temperature=0.7
-    )
+Claim classification: {prediction}
 
-    text = output[0]["generated_text"].strip()
-
-    # Fallback if model fails
-    if claim.lower() in text.lower() or len(text.split()) < 20:
-        return (
-            "The claim draws a strong conclusion without accounting for how election "
-            "reforms are implemented in practice. In India, any change to the election "
-            "schedule would require constitutional amendments, parliamentary approval, "
-            "and judicial oversight. Democratic functioning depends on multiple institutions "
-            "such as the legislature, courts, and independent bodies, not only on election timing. "
-            "The claim oversimplifies a complex policy discussion by ignoring these safeguards."
-        )
-
-    return text
+Explain why the claim may be misleading.
+Do not repeat the claim.
+Mention legal, constitutional, or procedural context.
+Write 4 clear sentences.
+"""
+    return hf_explain(prompt)
 
 # -------------------------
-# Keyword extraction
+# Source search
 # -------------------------
 def extract_search_terms(claim):
     if "one nation one election" in claim.lower():
-        return "One Nation One Election"
-    if "simultaneous" in claim.lower():
-        return "simultaneous elections India"
-    return "election reform India"
+        return "One Nation One Election constitutional amendment"
+    return "Indian election reform law"
 
-# -------------------------
-# Fetch sources
-# -------------------------
 def fetch_sources(claim):
     if "SERP_API_KEY" not in st.secrets:
         return []
 
-    search_term = extract_search_terms(claim)
-
-    query = (
-        f"{search_term} constitutional amendment "
-        f"{' OR '.join(TRUSTED_SITES)}"
-    )
-
+    query = f"{extract_search_terms(claim)} {' OR '.join(TRUSTED_SITES)}"
     params = {
         "q": query,
         "hl": "en",
@@ -122,58 +94,39 @@ def fetch_sources(claim):
     search = GoogleSearch(params)
     results = search.get_dict()
 
-    links = []
-    for r in results.get("organic_results", []):
-        links.append({
-            "title": r.get("title", ""),
-            "link": r.get("link", ""),
-            "snippet": r.get("snippet", "")
-        })
+    links = [{
+        "title": r.get("title", ""),
+        "link": r.get("link", ""),
+        "snippet": r.get("snippet", "")
+    } for r in results.get("organic_results", [])]
 
     return rank_sources(claim, links)
 
-# -------------------------
-# Rank sources (NO OVER-FILTERING)
-# -------------------------
 def rank_sources(claim, links):
     if not links:
         return []
 
-    texts = [claim] + [
-        l["title"] + " " + l["snippet"] for l in links
-    ]
+    texts = [claim] + [l["title"] + " " + l["snippet"] for l in links]
+    tfidf = TfidfVectorizer(stop_words="english").fit_transform(texts)
+    sims = cosine_similarity(tfidf[0:1], tfidf[1:]).flatten()
 
-    vectorizer = TfidfVectorizer(
-        stop_words="english",
-        ngram_range=(1, 2)
-    )
-
-    tfidf = vectorizer.fit_transform(texts)
-    similarities = cosine_similarity(tfidf[0:1], tfidf[1:]).flatten()
-
-    ranked = list(zip(similarities, links))
-    ranked.sort(reverse=True, key=lambda x: x[0])
-
-    # Return top matches (even if score is low)
+    ranked = sorted(zip(sims, links), reverse=True)
     return [l for _, l in ranked[:3]]
 
 # -------------------------
-# User input
+# UI
 # -------------------------
 claim = st.text_area(
     "Enter a political or election-related claim:",
     placeholder="Example: One Nation One Election will destroy democracy"
 )
 
-# -------------------------
-# Fact check
-# -------------------------
 if st.button("Check Fact"):
     if not claim.strip():
         st.warning("Please enter a claim.")
     else:
         labels = ["True", "False", "Misleading"]
-        result = classifier(claim, labels)
+        result = hf_zero_shot(claim, labels)
 
         prediction = result["labels"][0]
         confidence = round(result["scores"][0] * 100, 2)
@@ -182,29 +135,21 @@ if st.button("Check Fact"):
         st.write(f"**Prediction:** {prediction}")
         st.write(f"**Confidence:** {confidence}%")
 
-        st.subheader("📘 Why this claim may be misleading")
+        st.subheader("📘 Explanation")
         st.write(explain_claim(claim, prediction))
 
-        st.subheader("🔍 What voters should verify")
+        st.subheader("🔍 Official Sources")
         sources = fetch_sources(claim)
-
         if sources:
             for s in sources:
                 st.markdown(f"- [{s['title']}]({s['link']})")
         else:
-            st.write(
-                "No official sources could be retrieved automatically. "
-                "Users are encouraged to verify the claim using Election Commission "
-                "and parliamentary records."
-            )
+            st.write("No official sources retrieved automatically.")
 
         st.info(
-            "⚠️ This tool does not declare absolute truth. "
-            "It encourages voters to verify claims using official public sources."
+            "⚠️ This platform does not tell users what to believe. "
+            "It only checks factual verifiability using public records."
         )
 
-# -------------------------
-# Footer
-# -------------------------
 st.markdown("---")
 st.caption("Built for voter awareness and democratic education.")
